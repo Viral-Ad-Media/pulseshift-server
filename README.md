@@ -1,56 +1,73 @@
-# PulseShift API
+# PulseShift API — Neon PostgreSQL + Better Auth
 
-Express API for healthcare date-only staffing requests, private leave notes, administrator decisions, workspace invitations and advisory Gemini responses. The companion frontend is `Viral-Ad-Media/pulseshift`.
+Express API for date-only healthcare staffing requests, private leave notes, approvals, workspaces, invitations and advisory AI. Companion frontend: `Viral-Ad-Media/pulseshift`. Supabase is no longer a runtime dependency.
 
-## Setup
+## Architecture
 
-Use the Node version in `.nvmrc` (22.22.2) or supported Node 24.15+. Run `npm ci`, copy `.env.example` to `.env`, and configure Supabase URL and service-role key. Generate a unique JWT secret with `openssl rand -hex 32`; default, short, repetitive and example secrets are rejected in every environment. Restrict `CORS_ORIGIN` to your frontend URLs.
+- Neon PostgreSQL through the `pg` driver with a bounded connection pool and verified TLS.
+- Self-hosted Better Auth 1.7.16 on the existing API host. User, credential, verification and session rows live in the same Neon database.
+- Better Auth bearer sessions support the existing SPA/API deployment on separate Render domains. Tokens are opaque, revocable database sessions; the old custom JWT implementation is removed. Native Better Auth endpoints are mounted at `/api/auth/*` and preserve origin checks and bounded request bodies.
+- Existing workspace authorization remains independent of auth-provider roles: each protected tenant operation checks current application memberships. Only owners/admins receive private note fields.
+- PostgreSQL transaction functions retain quota locks, expected-version decisions, seat reservations, trial expiry and AI credit accounting.
 
-For a new Supabase project, run `supabase/schema.sql` and then `supabase/migrations/20261005_audit.sql` in the SQL editor. Run `npm start` or `npm run dev`. No accounts or demo data are seeded automatically. Startup fails if the migration is missing. `/health` is liveness and `/ready` checks database schema availability.
+Self-hosted Better Auth is used because credential migration requires a custom bcrypt verifier and the app has custom workspace creation/recovery flows. Managed Neon Auth is not required or enabled.
 
-The service-role key stays on the server. All app JWTs carry issuer, audience and a per-user session version, and all tenant routes check membership. Logout revokes existing sessions for that user. The historical seed IDs (`u-admin`, `u-jake`, `u-sergio`, `u-cgomez`, `u-devon`) cannot log in. Existing legitimate users keep their current password hashes, but old JWTs no longer authenticate.
+## Local setup
 
-## Upgrading an existing deployment
+Use Node 22.22.2 from `.nvmrc` or supported Node 24.15+. Run `npm ci`, copy `.env.example` to `.env`, and fill in:
 
-1. Back up the database and pause API writes during the coordinated upgrade.
-2. Check for invalid legacy dates before applying the migration. `select id,date from public.requests order by date;` provides the values; the migration aborts on impossible or noncanonical dates so they can be corrected deliberately. It does not silently move a request to a different day.
-3. Run `supabase/migrations/20261005_audit.sql` once against the existing schema. It is safe to rerun. It adds versions, cancellation timestamps, invitations, event history and service-only transaction functions, and converts legacy trial end dates to an inclusive UTC end-of-day timestamp.
-4. Configure a newly generated JWT secret and explicit frontend CORS URLs. Deploy this API and the companion frontend together: edits/cancellation now require request versions, and AI response drafting uses `requestId`. Old clients will receive 400 on versionless writes.
-5. Sign in again, test invite acceptance, a request/decision/cancellation, and `/ready`. Review existing demo data separately; the upgrade blocks known seeded logins but does not delete organizations or their history.
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Neon pooled PostgreSQL URL for request traffic |
+| `DATABASE_URL_UNPOOLED` | Direct Neon URL for migrations/imports |
+| `BETTER_AUTH_SECRET` | Unique random secret of at least 32 characters; generate with `openssl rand -hex 32` |
+| `BETTER_AUTH_URL` | Public API origin, e.g. `https://pulseshift-server.onrender.com`; do not append `/api/auth` |
+| `CORS_ORIGIN` | Comma-separated approved frontend origins |
+| `PORT` | Listener port; Render supplies this |
+| `GEMINI_API_KEY` | Optional; absence produces an explicit uncharged fallback |
+| `TRUST_PROXY_HOPS` | Optional, verified proxy-hop count; unset trusts no forwarded IPs |
 
-Do not run the migration against an unidentified project. Every `pulse_*` function revokes EXECUTE from PUBLIC, anon and authenticated and grants it only to service_role. RLS remains enabled on every data table, with no browser policies. App-managed JWTs do not directly authenticate to Supabase.
+Run `npm run db:migrate` using the direct URL. Then `npm run dev` or `npm start`. Production requires explicit HTTPS `BETTER_AUTH_URL` and frontend origins. Never put database passwords or auth secrets in a VITE variable or source control.
 
-## Transaction and entitlement policy
+## Render rollout
 
-- Signup creates the account, workspace/membership or invitation acceptance in one transaction, using full UUIDs. Failures roll back all writes without compensating deletes.
-- Request creation locks the organization and checks capacity before insert. One active request per person/date is enforced in Postgres. Decisions and edits lock and compare the current version; only owners may edit pending details and only admins may decide. Stale edits return 409.
-- Cancellation retains the record and an event, removes it from active schedules, and frees an active request slot. Approval/edit/cancellation events retain actor, timestamp, type and decision; private medical note text is not copied into events.
-- Plan request limits (40/120/500) are **active retained-request capacities**, not monthly throughput. Canceled rows do not count; rejected rows count until dismissed. No automatic billing-period reset is advertised.
-- New Team trials last exactly fourteen days. At expiration the effective plan becomes Essentials (40 active requests, no AI); historical requests remain visible and existing over-capacity workspaces may cancel/decide requests but cannot create more until below capacity. Existing non-trial plans retain their configured allowance.
-- AI credits (0/80/200) are lifetime workspace allowances until explicitly replenished by an administrator through the billing integration when one exists. Every provider attempt reserves one credit atomically before work and retains a usage event. Failed or malformed provider attempts also consume that reserved credit. Missing provider configuration does not consume credits. Fallbacks explicitly state that no availability check happened. AI is advisory and cannot approve requests.
+1. Create a dedicated Neon project/database for PulseShift; avoid sharing another application's database. A Vercel-managed Neon organization may require project creation from Vercel's Storage integration instead of Neon's project API.
+2. Set the database URLs, a freshly generated `BETTER_AUTH_SECRET`, public `BETTER_AUTH_URL` and actual frontend `CORS_ORIGIN` in the existing Render API service. `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `JWT_SECRET` are no longer used.
+3. Apply `npm run db:migrate` with the direct URL. The runner holds a PostgreSQL advisory lock, tracks file checksums and commits each file and its history record atomically. It is safe to run again. The free Render service cannot use a pre-deploy command, so run this as a release task from a trusted workstation or CI with encrypted secrets. Paid services may use a pre-deploy release task.
+4. Use build command `npm ci` and start command `npm start`. Set the HTTP health-check path to `/ready`.
+5. Deploy the companion frontend with `VITE_API_URL` pointing to this API. Both repository branches must be released together for resumable setup and account password changes.
+6. Verify sign-up, login, invitation acceptance, page reload, a protected request and logout. `/health` is process liveness; `/ready` verifies schema availability.
 
-## Teams
+A new deploy must be triggered after environment changes. No production credentials are written by this repository. Old JWTs do not carry over; users sign in again. No destructive project or database deletion is required.
 
-Admins can create a seven-day, single-use, email-bound invitation. The API returns the plaintext token only on creation and stores its SHA-256 hash. Active invitations reserve seats; expired/revoked ones do not. New accounts can include `inviteToken` at signup; existing signed-in users can accept via `POST /invitations/accept`. Users must use the invited email. Admins can revoke invitations, change roles and remove members, but cannot remove/demote the last administrator. Seat usage is derived from memberships. Invitation links are shared manually; there is no email delivery provider.
+## Existing data migration
 
-## Routes
+If a prior PulseShift database contains real data, pause application writes and back it up. Keep the source available until the Neon cutover is verified. The `db:import-legacy` script can read the previous PostgreSQL database, including a Supabase-hosted one, without the Supabase client or service-role API key:
 
-- `POST /auth/signup`, `POST /auth/login`, `POST /auth/logout`, `GET /me`
-- `GET /orgs/:orgId/full`, `GET /orgs/:orgId/requests`
-- `POST /orgs/:orgId/requests` (date, type, optional notes)
-- `PUT /orgs/:orgId/requests/:id` (version; owner details or admin decision)
-- `DELETE /orgs/:orgId/requests/:id` (JSON body containing version)
-- `GET/POST /orgs/:orgId/invitations`, `DELETE /orgs/:orgId/invitations/:id`
-- `POST /invitations/accept` (token)
-- `PUT/DELETE /orgs/:orgId/members/:userId`
-- `POST /ai/analyze` (orgId, date, type), `POST /ai/respond` (orgId, requestId, decision)
+1. Migrate an empty dedicated Neon target using `npm run db:migrate`.
+2. Provide the source direct PostgreSQL connection as `SOURCE_DATABASE_URL`, target direct URL as `DATABASE_URL_UNPOOLED`, and set `IMPORT_LEGACY_DATA=yes` in a private environment.
+3. Run `npm run db:import-legacy` once. The source transaction is read-only and repeatable-read. The destination must be empty. Inserts are one transaction and fail rather than overwrite data. Counts are printed; credentials and user data are not.
+4. The script copies application users, organizations, memberships, requests, invitations and events, preserving IDs and ownership. It imports real users' bcrypt credentials into Better Auth. Known demo IDs are intentionally excluded from auth. Existing passwords continue to work, including passwords shorter than the new signup minimum. New passwords use Better Auth's scrypt hasher. Re-running credential import never replaces a changed password.
+5. Verify counts, role assignments, requests and a representative login before pointing production traffic to Neon. Old sessions are not imported.
 
-Schedule endpoints redact coworkers' private notes and administrator replies for non-admin users. Owners and admins retain those fields.
+If data was restored with PostgreSQL tools before `db:migrate`, the auth migration imports those existing users directly. No data has been exported or imported merely by applying this repository change. Legacy `password_hash` values remain in the private application table for retention; they are not read by runtime login after the credential import.
 
-## Verification and operations
+## Account and workspace lifecycle
 
-`npm run check`, `npm test`, `npm audit --audit-level=low`. Tests execute migrations and transaction functions against embedded PostgreSQL (PGlite) and run actual Express HTTP requests for authorization, privacy, signup and invitations. PGlite has one connection; concurrent-call tests do not substitute for a multi-connection staging load test. CI runs these checks on every pull request.
+Compatibility routes `/auth/signup`, `/auth/login`, `/auth/logout` and `/me` delegate identity/session work to Better Auth. Native endpoints provide standard Better Auth session and password APIs. Logout revokes all database sessions for that user. Cookie caching is disabled so revocation is checked against the database immediately.
 
-Async bcrypt and bounded per-IP/per-account auth rate limits protect the event loop. In a replicated deployment, add a shared ingress rate limiter; the local limits are per API process. Trust proxy headers only after configuring the verified `TRUST_PROXY_HOPS` count; the default trusts no proxy. AI has a bounded provider timeout and the frontend request timeout is thirty seconds.
+Identity registration and workspace setup are intentionally two phases. The identity is never deleted to compensate for a workspace failure. The atomic `pulse_provision_workspace` transaction locks that identity, creates the application membership and workspace or accepts an invitation, and prevents duplicate workspaces on retry. If an invite is invalid or a setup write fails, the SPA retains the signed-in account and shows a resumable setup form. Native Better Auth signup also reaches that form after sign-in. Existing accounts with memberships do not need setup.
 
-Password recovery, email notifications, real billing/payment collection and SSO are not integrated. Plan changes remain an explicit sales workflow. Database backups, retention policy and external provider availability remain deployment responsibilities.
+The Account dialog changes a password with the current password and signs out other sessions. Password reset email delivery, email verification delivery, social OAuth, SSO and payment collection are not configured by this migration. These should be enabled only with the required provider settings and user-facing flows.
+
+## Plans, requests and invitations
+
+Limits are active retained-request capacities (40/120/500) and lifetime AI allowances (0/80/200), not monthly throughput. New trials last fourteen days then use Essentials entitlements. Cancellation retains history and frees an active slot. Each provider attempt atomically reserves one credit, including failed/malformed attempts; no provider configuration means no charge. AI is advisory and cannot approve a request.
+
+Seven-day email-bound invitations reserve seats. They are manually shared, single-use and stored as hashes. Role changes and membership removal cannot leave a workspace without an administrator. Owner edits and admin decisions require the current request version; conflicts return 409.
+
+## Checks
+
+`npm run check`, `npm test`, `npm audit --audit-level=low`. Tests use the real Better Auth server and PostgreSQL SQL engine (PGlite), exercising legacy passwords/IDs, sessions, revocation, password changes, privacy, permissions, invitations, resumable setup, quota races, migrations and read-only import. PGlite is single-connection; production multi-connection load testing remains a staging check. CI runs these checks on every PR.
+
+Auth limits use bounded per-process memory and Express-derived IPs. For multiple replicas, enforce shared limits at the ingress as well. Do not trust user-supplied forwarded IPs without verifying the hosting topology.

@@ -1,7 +1,8 @@
 import cors from "cors";
 import express from "express";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+import { fromNodeHeaders } from "better-auth/node";
+import { getRequest, setResponse } from "better-call/node";
+import { DEMO_IDS } from "./auth.js";
 import { randomUUID, randomBytes } from "node:crypto";
 import {
   email,
@@ -10,7 +11,6 @@ import {
   timezone,
   isIsoDate,
   expectedVersion,
-  validateSecret,
   hashInvite,
   effectiveOrg,
   REQUEST_TYPES,
@@ -20,18 +20,16 @@ import {
 
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
-const issuer = "pulseshift-api";
-const audience = "pulseshift-client";
 export function createApp({
   db,
-  secret,
+  authentication,
   ai = null,
   corsOrigin = "http://localhost:3000",
   trustProxy = false,
   authMax = 20,
   logger = console,
 }) {
-  validateSecret(secret);
+  if (!authentication) throw new Error("Better Auth must be configured");
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", trustProxy);
@@ -41,6 +39,26 @@ export function createApp({
         .split(",")
         .map((v) => v.trim())
         .filter(Boolean),
+    }),
+  );
+  // The native Better Auth handler must receive the unparsed request body.
+  app.use((req, res, next) => {
+    req.headers["x-pulseshift-ip"] = req.ip;
+    res.set("Cache-Control", "no-store");
+    res.set("X-Content-Type-Options", "nosniff");
+    next();
+  });
+  app.all(
+    "/api/auth/*",
+    asyncHandler(async (req, res) => {
+      if (Number(req.headers["content-length"] || 0) > 32768)
+        throw httpError(413, "Request body too large");
+      const request = getRequest({
+        request: req,
+        base: authentication.options.baseURL,
+        bodySizeLimit: 32768,
+      });
+      await setResponse(res, await authentication.handler(request));
     }),
   );
   app.use(express.json({ limit: "32kb", strict: true }));
@@ -132,14 +150,7 @@ export function createApp({
         : {}),
     };
   };
-  const signToken = (user) =>
-    jwt.sign({ sub: user.id, ver: user.token_version }, secret, {
-      algorithm: "HS256",
-      issuer,
-      audience,
-      expiresIn: "12h",
-    });
-  const session = async (user, includeToken = true) => {
+  const session = async (user, token = null) => {
     const memberships = await rows("memberships", "org_id,role", (q) =>
       q.eq("user_id", user.id),
     );
@@ -156,38 +167,51 @@ export function createApp({
         await rows("memberships", "user_id", (q) => q.eq("org_id", org.id))
       ).length;
     return {
-      ...(includeToken ? { token: signToken(user) } : {}),
+      ...(typeof token === "string" ? { token } : {}),
+      setupRequired: memberships.length === 0,
       user: userDto(user),
       orgs: orgs.map(orgDto),
       memberships: memberships.map((m) => ({ orgId: m.org_id, role: m.role })),
     };
   };
-  const auth = asyncHandler(async (req, res, next) => {
-    let payload;
-    if (!req.headers.authorization?.startsWith("Bearer "))
-      throw httpError(401, "Missing auth token");
-    try {
-      payload = jwt.verify(req.headers.authorization.slice(7), secret, {
-        algorithms: ["HS256"],
-        issuer,
-        audience,
-      });
-    } catch {
-      throw httpError(401, "Sign in again to continue");
-    }
-    if (typeof payload.sub !== "string" || !Number.isSafeInteger(payload.ver))
-      throw httpError(401, "Invalid session");
-    const user = await row(
-      "users",
-      "id,email,name,avatar_url,title,token_version",
-      (q) => q.eq("id", payload.sub),
+  const syncUser = async (identity) => {
+    if (DEMO_IDS.has(identity.id))
+      throw httpError(403, "Demo accounts are disabled");
+    await db.pool.query(
+      `insert into public.users(id,email,name,avatar_url,title) values($1,$2,$3,$4,'Team Member') on conflict(id) do update set name=excluded.name,email=excluded.email,avatar_url=excluded.avatar_url`,
+      [identity.id, identity.email, identity.name, identity.image || null],
     );
-    if (!user || user.token_version !== payload.ver)
-      throw httpError(401, "Session expired. Sign in again.");
-    req.user = user;
-    req.userId = user.id;
+    return row("users", "id,email,name,avatar_url,title", (q) =>
+      q.eq("id", identity.id),
+    );
+  };
+  const auth = asyncHandler(async (req, res, next) => {
+    const current = await authentication.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+    if (!current) throw httpError(401, "Session expired. Sign in again.");
+    req.user = await syncUser(current.user);
+    req.userId = current.user.id;
+    req.authSession = current;
     next();
   });
+  const setupArgs = (body) => {
+    const inviteToken = text(body.inviteToken, "invitation token", 128, true);
+    return {
+      p_org_name: inviteToken
+        ? null
+        : text(body.orgName, "workspace name", 100),
+      p_timezone: timezone(body.timezone),
+      p_industry: text(body.industry, "industry", 80, true) || "Healthcare",
+      p_invite_hash: inviteToken ? hashInvite(inviteToken) : null,
+    };
+  };
+  const provision = (userId, args) =>
+    rpc("pulse_provision_workspace", {
+      p_user_id: userId,
+      p_org_id: `org-${randomUUID()}`,
+      ...args,
+    });
   const member = asyncHandler(async (req, res, next) => {
     const orgId = text(req.params.orgId || req.body.orgId, "organization", 80);
     const membership = await row("memberships", "*", (q) =>
@@ -222,66 +246,68 @@ export function createApp({
       const userEmail = email(req.body.email),
         userPassword = password(req.body.password, true),
         name = text(req.body.name, "name", 100);
-      const inviteToken = text(
-        req.body.inviteToken,
-        "invitation token",
-        128,
-        true,
-      );
-      const orgName = inviteToken
-        ? null
-        : text(req.body.orgName, "workspace name", 100);
-      const hash = await bcrypt.hash(userPassword, 12);
-      const user = await rpc("pulse_signup", {
-        p_user_id: `u-${randomUUID()}`,
-        p_org_id: `org-${randomUUID()}`,
-        p_email: userEmail,
-        p_password_hash: hash,
-        p_name: name,
-        p_org_name: orgName,
-        p_timezone: timezone(req.body.timezone),
-        p_industry:
-          text(req.body.industry, "industry", 80, true) || "Healthcare",
-        p_invite_hash: inviteToken ? hashInvite(inviteToken) : null,
+      const args = setupArgs(req.body);
+      const result = await authentication.api.signUpEmail({
+        body: { email: userEmail, password: userPassword, name },
+        headers: fromNodeHeaders(req.headers),
       });
-      res.status(201).json(await session(user));
+      const user = await syncUser(result.user);
+      try {
+        await provision(user.id, args);
+      } catch (error) {
+        // The identity remains usable: show resumable setup instead of deleting a valid account.
+        if (error.status && error.status < 500)
+          return res
+            .status(201)
+            .json({
+              ...(await session(user, result.token)),
+              setupError: error.message,
+            });
+        logger.error("Workspace setup needs retry", { code: error.code });
+        return res
+          .status(201)
+          .json({
+            ...(await session(user, result.token)),
+            setupError: "Account created. Please retry workspace setup.",
+          });
+      }
+      res.status(201).json(await session(user, result.token));
     }),
   );
-  // Fixed hash keeps unknown-user login timing comparable without hashing synchronously.
-  const dummyHash =
-    "$2a$12$q58xqdrEWJqWPPIQCQY4/eNZjMvgfhZYkSlDlcNhh.ywh06tlDl9O";
   app.post(
     "/auth/login",
     asyncHandler(async (req, res) => {
-      const userEmail = email(req.body.email),
-        userPassword = password(req.body.password);
-      const user = await row("users", "*", (q) => q.eq("email", userEmail));
-      const valid = await bcrypt.compare(
-        userPassword,
-        user?.password_hash || dummyHash,
-      );
-      if (
-        !user ||
-        !valid ||
-        ["u-admin", "u-jake", "u-sergio", "u-cgomez", "u-devon"].includes(
-          user.id,
-        )
-      )
-        throw httpError(401, "Invalid credentials");
-      res.json(await session(user));
+      const result = await authentication.api.signInEmail({
+        body: {
+          email: email(req.body.email),
+          password: password(req.body.password),
+        },
+        headers: fromNodeHeaders(req.headers),
+      });
+      res.json(await session(await syncUser(result.user), result.token));
     }),
   );
   app.get(
     "/me",
     auth,
-    asyncHandler(async (req, res) => res.json(await session(req.user, false))),
+    asyncHandler(async (req, res) => res.json(await session(req.user))),
   );
   app.post(
     "/auth/logout",
     auth,
     asyncHandler(async (req, res) => {
-      await rpc("pulse_revoke_sessions", { p_user_id: req.userId });
+      await authentication.api.revokeSessions({
+        headers: fromNodeHeaders(req.headers),
+      });
       res.json({ ok: true });
+    }),
+  );
+  app.post(
+    "/workspaces",
+    auth,
+    asyncHandler(async (req, res) => {
+      await provision(req.userId, setupArgs(req.body));
+      res.status(201).json(await session(req.user));
     }),
   );
   const requests = (orgId) =>
@@ -521,7 +547,9 @@ export function createApp({
         aiCredits: event.ai_credits,
       };
     } catch (error) {
-      logger.error("AI attempt failed", { message: error.message });
+      logger.error("AI attempt failed", {
+        message: error.body?.message || error.message,
+      });
       try {
         await rpc("pulse_finish_ai", { p_id: event.id, p_status: "FAILED" });
       } catch (e) {
@@ -605,17 +633,18 @@ export function createApp({
   );
   app.use((error, req, res, next) => {
     if (res.headersSent) return next(error);
-    const status = error.status || 500;
+    const status = Number(error.statusCode || error.status) || 500;
     if (status >= 500)
-      logger.error("Request failed", { status, message: error.message });
-    res
-      .status(status)
-      .json({
-        error:
-          status >= 500
-            ? "Service unavailable. Try again later."
-            : error.message,
+      logger.error("Request failed", {
+        status,
+        message: error.body?.message || error.message,
       });
+    res.status(status).json({
+      error:
+        status >= 500
+          ? "Service unavailable. Try again later."
+          : error.body?.message || error.message,
+    });
   });
   return app;
 }

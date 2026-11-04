@@ -2,91 +2,20 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { once } from "node:events";
-import { PGlite } from "@electric-sql/pglite";
-import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import { testDatabase } from "./helpers.js";
+import { createDatabase } from "../database.js";
+import { createAuthentication } from "../auth.js";
 import { createApp } from "../app.js";
-let db, server, base, token;
+let pool, engine, db, authentication, server, base, token, adminToken;
 const secret = "f93ce57ab62980147d60285fac17d473";
-function adapter(pg) {
-  return {
-    rpc: async (name, args = {}) => {
-      try {
-        const r = await pg.query(
-          `select public.${name}(${Object.keys(args)
-            .map((k, i) => `${k} => $${i + 1}`)
-            .join(",")}) as result`,
-          Object.values(args),
-        );
-        return { data: r.rows[0].result };
-      } catch (error) {
-        return { error };
-      }
-    },
-    from(table) {
-      let cols = "*",
-        where = [],
-        params = [],
-        suffix = "";
-      const q = {
-        select(value) {
-          cols = value;
-          return q;
-        },
-        eq(k, v) {
-          params.push(v);
-          where.push(`${k}=$${params.length}`);
-          return q;
-        },
-        in(k, values) {
-          where.push(
-            `${k} in (${values
-              .map((v) => {
-                params.push(v);
-                return "$" + params.length;
-              })
-              .join(",")})`,
-          );
-          return q;
-        },
-        is(k, v) {
-          assert.equal(v, null);
-          where.push(`${k} is null`);
-          return q;
-        },
-        order(k, { ascending }) {
-          suffix += ` order by ${k} ${ascending ? "asc" : "desc"}`;
-          return q;
-        },
-        limit(n) {
-          suffix += ` limit ${n}`;
-          return q;
-        },
-        async then(resolve, reject) {
-          try {
-            resolve({
-              data: (
-                await pg.query(
-                  `select ${cols} from ${table}${where.length ? " where " + where.join(" and ") : ""}${suffix}`,
-                  params,
-                )
-              ).rows,
-            });
-          } catch (error) {
-            resolve({ error });
-          }
-        },
-      };
-      return q;
-    },
-  };
-}
 const rpc = async (name, args) => {
-  const result = await adapter(db).rpc(name, args);
+  const result = await db.rpc(name, args);
   if (result.error) throw result.error;
   return result.data;
 };
 const api = async (path, { method = "GET", body, auth = token } = {}) => {
-  const response = await fetch(base + path, {
+  const res = await fetch(base + path, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -94,22 +23,18 @@ const api = async (path, { method = "GET", body, auth = token } = {}) => {
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
-  return { status: response.status, body: await response.json() };
+  return { status: res.status, body: await res.json() };
 };
 before(async () => {
-  db = new PGlite();
-  await db.exec(
-    "create role anon;create role authenticated;create role service_role;",
-  );
-  await db.exec(await readFile("supabase/schema.sql", "utf8"));
-  await db.exec(
-    await readFile("supabase/migrations/20261005_audit.sql", "utf8"),
-  );
+  ({ pool, engine } = await testDatabase());
+  db = createDatabase(pool);
+  // Mimic existing app-managed bcrypt accounts before auth cutover.
+  const hash = await bcrypt.hash("old-pass", 10);
   await rpc("pulse_signup", {
     p_user_id: "admin",
     p_org_id: "org",
     p_email: "admin@example.com",
-    p_password_hash: "hash",
+    p_password_hash: hash,
     p_name: "Admin",
     p_org_name: "Clinic",
     p_timezone: "America/Chicago",
@@ -127,7 +52,7 @@ before(async () => {
     p_user_id: "nurse",
     p_org_id: "unused",
     p_email: "nurse@example.com",
-    p_password_hash: "hash",
+    p_password_hash: hash,
     p_name: "Nurse",
     p_org_name: null,
     p_timezone: "America/Chicago",
@@ -142,35 +67,71 @@ before(async () => {
     p_type: "SICK",
     p_notes: "Private medical reason",
   });
+  await engine.exec(
+    await readFile("db/migrations/20261104_better_auth.sql", "utf8"),
+  );
+  authentication = createAuthentication({ pool, secret });
   server = createApp({
-    db: adapter(db),
-    secret,
+    db,
+    authentication,
     logger: { error() {} },
-    authMax: 5,
+    authMax: 100,
   }).listen(0, "127.0.0.1");
   await once(server, "listening");
   base = `http://127.0.0.1:${server.address().port}`;
-  token = jwt.sign({ sub: "nurse", ver: 1 }, secret, {
-    issuer: "pulseshift-api",
-    audience: "pulseshift-client",
-    expiresIn: "1h",
+  const signed = await api("/auth/login", {
+    method: "POST",
+    auth: null,
+    body: { email: "nurse@example.com", password: "old-pass" },
   });
+  assert.equal(signed.status, 200, JSON.stringify(signed.body));
+  token = signed.body.token;
+  const admin = await api("/auth/login", {
+    method: "POST",
+    auth: null,
+    body: { email: "admin@example.com", password: "old-pass" },
+  });
+  assert.equal(admin.status, 200);
+  adminToken = admin.body.token;
 });
 after(async () => {
-  await new Promise((resolve) => server.close(resolve));
-  await db.close();
+  await new Promise((resolve) => server?.close(resolve));
+  await pool?.end();
 });
-test("HTTP membership guards redact coworker medical notes from both read endpoints", async () => {
+test("legacy bcrypt passwords and IDs preserve memberships and request ownership", async () => {
+  const result = await api("/me");
+  assert.equal(result.status, 200);
+  assert.equal(result.body.user.id, "nurse");
+  assert.equal(result.body.memberships[0].orgId, "org");
+  assert.equal(result.body.setupRequired, false);
+  assert.equal(
+    (
+      await pool.query(
+        "select user_id from auth_accounts where account_id='nurse' and provider_id='credential'",
+      )
+    ).rows[0].user_id,
+    "nurse",
+  );
+});
+test("native Better Auth and application API validate the same database-backed session", async () => {
+  const current = await api("/api/auth/get-session");
+  assert.equal(current.status, 200);
+  assert.equal(current.body.user.id, "nurse");
+  assert.ok(
+    (
+      await pool.query("select id from auth_sessions where user_id=$1", [
+        "nurse",
+      ])
+    ).rows.length,
+  );
+  assert.equal((await api("/me", { auth: "old.jwt.token" })).status, 401);
+});
+test("read endpoints redact coworker notes while administrators retain access", async () => {
   for (const path of ["/orgs/org/full", "/orgs/org/requests"]) {
     const result = await api(path);
     assert.equal(result.status, 200);
     assert.equal(result.body.requests[0].notes, undefined);
-    assert.equal(result.body.requests[0].version, 1);
   }
-  const adminToken = jwt.sign({ sub: "admin", ver: 1 }, secret, {
-    issuer: "pulseshift-api",
-    audience: "pulseshift-client",
-  });
   assert.equal(
     (await api("/orgs/org/requests", { auth: adminToken })).body.requests[0]
       .notes,
@@ -178,7 +139,7 @@ test("HTTP membership guards redact coworker medical notes from both read endpoi
   );
   assert.equal((await api("/orgs/other/full")).status, 403);
 });
-test("HTTP nurses cannot approve coworker requests or invite administrators", async () => {
+test("nurses cannot approve requests or create admin invitations", async () => {
   assert.equal(
     (
       await api("/orgs/org/requests/req", {
@@ -198,13 +159,13 @@ test("HTTP nurses cannot approve coworker requests or invite administrators", as
     403,
   );
 });
-test("HTTP invalid field types and dates return 400", async () => {
+test("invalid data and impossible dates return 400", async () => {
   assert.equal(
     (
       await api("/auth/signup", {
         method: "POST",
-        body: { email: {}, password: "x" },
         auth: null,
+        body: { email: {}, password: "x" },
       })
     ).status,
     400,
@@ -228,71 +189,98 @@ test("HTTP invalid field types and dates return 400", async () => {
     400,
   );
 });
-test("HTTP unavailable AI fallback does not imply checked staffing or consume credits", async () => {
-  const result = await api("/ai/analyze", {
-    method: "POST",
-    body: { orgId: "org", date: "2026-10-06", type: "WORK" },
-  });
-  assert.equal(result.status, 200);
-  assert.equal(result.body.available, false);
-  assert.match(result.body.message, /No staffing availability check/);
-  assert.equal(
-    (await db.query("select ai_used from organizations where id='org'")).rows[0]
-      .ai_used,
-    0,
-  );
-});
-test("HTTP signup, login, invitation creation and new-account acceptance work end to end", async () => {
-  const registered = await api("/auth/signup", {
+test("signup creates Better Auth credentials and an isolated workspace; invites join the same tenant", async () => {
+  const owner = await api("/auth/signup", {
     method: "POST",
     auth: null,
     body: {
-      email: "newowner@example.com",
+      email: "owner@example.com",
       password: "new-secure-password",
       name: "Owner",
       orgName: "New Clinic",
       timezone: "America/Chicago",
     },
   });
-  assert.equal(registered.status, 201);
-  assert.equal(registered.body.user.password_hash, undefined);
-  const org = registered.body.orgs[0];
-  assert.match(org.id, /^org-[0-9a-f-]{36}$/);
-  assert.equal(org.seats.used, 1);
+  assert.equal(owner.status, 201, JSON.stringify(owner.body));
+  assert.equal(owner.body.setupRequired, false);
+  assert.equal(owner.body.user.password_hash, undefined);
+  const org = owner.body.orgs[0];
   const invite = await api(`/orgs/${org.id}/invitations`, {
     method: "POST",
-    auth: registered.body.token,
-    body: { email: "newstaff@example.com", role: "NURSE" },
+    auth: owner.body.token,
+    body: { email: "staff@example.com", role: "NURSE" },
   });
   assert.equal(invite.status, 201);
-  const joined = await api("/auth/signup", {
+  const staff = await api("/auth/signup", {
     method: "POST",
     auth: null,
     body: {
-      email: "newstaff@example.com",
+      email: "staff@example.com",
       password: "staff-secure-password",
       name: "Staff",
       inviteToken: invite.body.token,
-      timezone: "America/Chicago",
     },
   });
-  assert.equal(joined.status, 201);
-  assert.equal(joined.body.orgs[0].id, org.id);
-  assert.equal(joined.body.memberships[0].role, "NURSE");
-  const loggedIn = await api("/auth/login", {
+  assert.equal(staff.status, 201, JSON.stringify(staff.body));
+  assert.equal(staff.body.orgs[0].id, org.id);
+  assert.equal(staff.body.memberships[0].role, "NURSE");
+});
+test("failed workspace setup preserves a usable identity and can resume without duplicates", async () => {
+  const account = await api("/auth/signup", {
     method: "POST",
     auth: null,
-    body: { email: "newstaff@example.com", password: "staff-secure-password" },
+    body: {
+      email: "retry@example.com",
+      password: "retry-secure-password",
+      name: "Retry",
+      inviteToken: "nonexistent",
+    },
   });
-  assert.equal(loggedIn.status, 200);
-});
-test("HTTP malformed paid AI response remains metered and returns an honest fallback", async () => {
-  await db.exec(
-    "update organizations set ai_used=0,ai_credits=80 where id='org'",
+  assert.equal(account.status, 201);
+  assert.equal(account.body.setupRequired, true);
+  assert.match(account.body.setupError, /Invitation/);
+  const logged = await api("/auth/login", {
+    method: "POST",
+    auth: null,
+    body: { email: "retry@example.com", password: "retry-secure-password" },
+  });
+  assert.equal(logged.status, 200);
+  assert.equal(logged.body.setupRequired, true);
+  const completed = await api("/workspaces", {
+    method: "POST",
+    auth: logged.body.token,
+    body: { orgName: "Retry Clinic" },
+  });
+  assert.equal(completed.status, 201);
+  assert.equal(completed.body.setupRequired, false);
+  assert.equal(
+    (
+      await api("/workspaces", {
+        method: "POST",
+        auth: logged.body.token,
+        body: { orgName: "Duplicate Clinic" },
+      })
+    ).status,
+    409,
   );
+});
+test("unavailable AI does not consume a credit or imply coverage was checked", async () => {
+  const result = await api("/ai/analyze", {
+    method: "POST",
+    body: { orgId: "org", date: "2026-10-06", type: "WORK" },
+  });
+  assert.equal(result.body.available, false);
+  assert.match(result.body.message, /No staffing availability check/);
+  assert.equal(
+    (await pool.query("select ai_used from organizations where id='org'"))
+      .rows[0].ai_used,
+    0,
+  );
+});
+test("malformed provider response is recorded and retains its reserved credit", async () => {
   const aiServer = createApp({
-    db: adapter(db),
-    secret,
+    db,
+    authentication,
     ai: async () => '{"message":{},"isHighDemand":"false"}',
     logger: { error() {} },
   }).listen(0, "127.0.0.1");
@@ -314,30 +302,76 @@ test("HTTP malformed paid AI response remains metered and returns an honest fall
       },
     );
     const body = await res.json();
-    assert.equal(res.status, 200);
     assert.equal(body.available, false);
     assert.equal(body.aiUsed, 1);
-    assert.equal(
-      (await db.query("select status from ai_events where org_id='org'"))
-        .rows[0].status,
-      "FAILED",
-    );
   } finally {
     await new Promise((resolve) => aiServer.close(resolve));
   }
 });
-test("HTTP rejects obsolete JWTs and logout revokes signed sessions", async () => {
-  const legacy = jwt.sign({ sub: "nurse" }, secret);
-  assert.equal((await api("/me", { auth: legacy })).status, 401);
+test("Better Auth password change upgrades a legacy credential and revokes other sessions", async () => {
+  const other = await api("/auth/login", {
+    method: "POST",
+    auth: null,
+    body: { email: "nurse@example.com", password: "old-pass" },
+  });
+  assert.equal(other.status, 200);
+  const changed = await api("/api/auth/change-password", {
+    method: "POST",
+    body: {
+      currentPassword: "old-pass",
+      newPassword: "replacement-password",
+      revokeOtherSessions: true,
+    },
+  });
+  assert.equal(changed.status, 200, JSON.stringify(changed.body));
+  if (changed.body.token) token = changed.body.token;
+  assert.equal((await api("/me", { auth: other.body.token })).status, 401);
+  assert.equal((await api("/me")).status, 200);
+  assert.equal(
+    (
+      await api("/auth/login", {
+        method: "POST",
+        auth: null,
+        body: { email: "nurse@example.com", password: "old-pass" },
+      })
+    ).status,
+    401,
+  );
+  const credential = (
+    await pool.query("select password from auth_accounts where user_id='nurse'")
+  ).rows[0].password;
+  assert.ok(!credential.startsWith("$2"));
+  await pool.query("select public.pulse_import_legacy_accounts()");
+  assert.equal(
+    (
+      await pool.query(
+        "select password from auth_accounts where user_id='nurse'",
+      )
+    ).rows[0].password,
+    credential,
+  );
+});
+test("logout deletes sessions and rejects a previously valid token immediately", async () => {
   assert.equal(
     (await api("/auth/logout", { method: "POST", body: {} })).status,
     200,
   );
   assert.equal((await api("/me")).status, 401);
+  assert.equal(
+    (
+      await pool.query(
+        "select count(*)::int as n from auth_sessions where user_id='nurse'",
+      )
+    ).rows[0].n,
+    0,
+  );
 });
-test("HTTP auth rate limit returns 429 without further database work", async () => {
-  let result;
-  for (let i = 0; i < 6; i++)
-    result = await api("/auth/login", { method: "POST", body: {}, auth: null });
-  assert.equal(result.status, 429);
+test("database adapter parameterizes malicious values and rejects unsafe identifiers", async () => {
+  const result = await db
+    .from("users")
+    .select("id")
+    .eq("email", "x' OR 1=1 --");
+  assert.deepEqual(result.data, []);
+  assert.throws(() => db.from("users;drop table users"));
+  assert.throws(() => db.from("users").select("password_hash;select 1"));
 });

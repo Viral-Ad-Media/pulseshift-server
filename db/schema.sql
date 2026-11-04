@@ -1,5 +1,4 @@
--- PulseShift Supabase schema
--- Run this file in the Supabase SQL editor before starting the API.
+-- PulseShift PostgreSQL application schema. Managed by npm run db:migrate.
 
 begin;
 

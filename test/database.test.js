@@ -39,13 +39,9 @@ before(async () => {
   await db.exec(
     "create role anon; create role authenticated; create role service_role;",
   );
-  await db.exec(await readFile("supabase/schema.sql", "utf8"));
-  await db.exec(
-    await readFile("supabase/migrations/20261005_audit.sql", "utf8"),
-  );
-  await db.exec(
-    await readFile("supabase/migrations/20261005_audit.sql", "utf8"),
-  );
+  await db.exec(await readFile("db/schema.sql", "utf8"));
+  await db.exec(await readFile("db/migrations/20261005_audit.sql", "utf8"));
+  await db.exec(await readFile("db/migrations/20261005_audit.sql", "utf8"));
   await signup("admin", "org", "admin@example.com");
 });
 after(async () => db.close());
