@@ -35,7 +35,7 @@ test("date, timezone, email and password validation rejects wrong types and inva
   assert.throws(() => timezone("bad-zone"));
   assert.throws(() => email("x"));
   assert.throws(() => password("short", true));
-  assert.throws(() => password("é".repeat(37), true));
+  assert.throws(() => password("é".repeat(73), true));
   assert.equal(email(" USER@EXAMPLE.COM "), "user@example.com");
 });
 test("expired trial projection matches server entitlement policy", () => {

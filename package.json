@@ -1,6 +1,6 @@
 {
   "name": "pulseshift-server",
-  "description": "Standalone Express and Supabase API for PulseShift.",
+  "description": "Standalone Express API using Neon PostgreSQL and Better Auth.",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -11,16 +11,19 @@
     "dev": "node --watch server.js",
     "start": "node server.js",
     "test": "node --test test/*.test.js",
-    "check": "node --check server.js && node --check app.js && node --check security.js && node --check supabase.js"
+    "check": "node --check server.js && node --check app.js && node --check security.js && node --check database.js && node --check auth.js && node --check scripts/migrate.js && node --check scripts/import-legacy.js",
+    "db:migrate": "node scripts/migrate.js",
+    "db:import-legacy": "node scripts/import-legacy.js"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
-    "@supabase/supabase-js": "^2.57.4",
     "bcryptjs": "^2.4.3",
+    "better-auth": "1.7.16",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.19.2",
-    "jsonwebtoken": "^9.0.2"
+    "pg": "8.23.1",
+    "better-call": "1.4.5"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8"

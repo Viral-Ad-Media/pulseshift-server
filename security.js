@@ -16,7 +16,7 @@ export function validateSecret(secret) {
     new Set(secret).size < 12
   ) {
     throw new Error(
-      "JWT_SECRET must be a unique random secret of at least 32 characters. Generate one with: openssl rand -hex 32",
+      "BETTER_AUTH_SECRET must be a unique random secret of at least 32 characters. Generate one with: openssl rand -hex 32",
     );
   }
   return secret;
@@ -43,10 +43,10 @@ export function password(value, strong = false) {
   if (
     typeof value !== "string" ||
     !value ||
-    Buffer.byteLength(value, "utf8") > 72 ||
+    value.length > 72 ||
     (strong && value.length < 12)
   )
-    throw httpError(400, "Password must be 12–72 bytes for new accounts");
+    throw httpError(400, "Password must be 12–72 characters for new accounts");
   return value;
 }
 export function isIsoDate(value) {

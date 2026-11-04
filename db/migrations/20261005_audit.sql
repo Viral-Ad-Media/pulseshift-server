@@ -199,13 +199,13 @@ end;$$;
 create or replace function public.pulse_schema_ready() returns boolean
 language sql security definer set search_path = public, pg_temp as $$ select exists(select 1 from pg_attribute where attrelid='public.requests'::regclass and attname='version') and to_regclass('public.ai_events') is not null and to_regclass('public.invitations') is not null; $$;
 
--- Functions use elevated access only through the authenticated application server.
+-- Functions are private to the database owner used by the application server.
 -- Postgres grants EXECUTE to PUBLIC by default, so revoke every exact pulse signature.
 do $$ declare fn record;
 begin
  for fn in select p.oid::regprocedure as signature from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname like 'pulse_%' loop
-   execute format('revoke all on function %s from public, anon, authenticated',fn.signature);
-   execute format('grant execute on function %s to service_role',fn.signature);
+   execute format('revoke all on function %s from public',fn.signature);
+   execute format('grant execute on function %s to %I',fn.signature,current_user);
  end loop;
 end;$$;
 commit;
