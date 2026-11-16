@@ -1,8 +1,9 @@
 import { betterAuth } from "better-auth";
-import { bearer } from "better-auth/plugins";
+import { bearer, twoFactor } from "better-auth/plugins";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import bcrypt from "bcryptjs";
 import { randomUUID } from "node:crypto";
+import { makeResetMailer } from "./integrations.js";
 import { validateSecret } from "./security.js";
 export const DEMO_IDS = new Set([
   "u-admin",
@@ -63,6 +64,7 @@ export function authOptions({
   secret,
   baseURL = "http://localhost:4000",
   trustedOrigins = ["http://localhost:3000"],
+  sendResetPassword = makeResetMailer(),
 }) {
   validateSecret(secret);
   return {
@@ -78,6 +80,13 @@ export function authOptions({
       minPasswordLength: 12,
       maxPasswordLength: 72,
       autoSignIn: true,
+      ...(sendResetPassword
+        ? {
+            sendResetPassword,
+            revokeSessionsOnPasswordReset: true,
+            resetPasswordTokenExpiresIn: 3600,
+          }
+        : {}),
       password: {
         hash: hashPassword,
         verify: async ({ hash, password }) =>
@@ -92,7 +101,24 @@ export function authOptions({
       ipAddress: { ipAddressHeaders: ["x-pulseshift-ip"] },
       database: { generateId: () => `u-${randomUUID()}` },
     },
-    plugins: [bearer()],
+    plugins: [
+      bearer(),
+      twoFactor({
+        issuer: "PulseShift",
+        twoFactorTable: "auth_two_factors",
+        schema: {
+          user: { fields: { twoFactorEnabled: "two_factor_enabled" } },
+          twoFactor: {
+            fields: {
+              userId: "user_id",
+              backupCodes: "backup_codes",
+              failedVerificationCount: "failed_verification_count",
+              lockedUntil: "locked_until",
+            },
+          },
+        },
+      }),
+    ],
     databaseHooks: {
       session: {
         create: {

@@ -9,9 +9,10 @@
   },
   "scripts": {
     "dev": "node --watch server.js",
+    "dev:local": "node local-dev.js",
     "start": "node server.js",
     "test": "node --test test/*.test.js",
-    "check": "node --check server.js && node --check app.js && node --check security.js && node --check database.js && node --check auth.js && node --check scripts/migrate.js && node --check scripts/import-legacy.js",
+    "check": "node --check server.js && node --check app.js && node --check scheduling.js && node --check workforce.js && node --check workforce-rules.js && node --check integrations.js && node --check account-security.js && node --check local-dev.js && node --check security.js && node --check database.js && node --check auth.js && node --check scripts/migrate.js && node --check scripts/import-legacy.js",
     "db:migrate": "node scripts/migrate.js",
     "db:import-legacy": "node scripts/import-legacy.js"
   },

@@ -1,9 +1,14 @@
+import { createWorkforce } from "./workforce.js";
+import { createBilling } from "./integrations.js";
+import { createAccountSecurity } from "./account-security.js";
 import cors from "cors";
 import express from "express";
 import { fromNodeHeaders } from "better-auth/node";
 import { getRequest, setResponse } from "better-call/node";
 import { DEMO_IDS } from "./auth.js";
 import { randomUUID, randomBytes } from "node:crypto";
+import { createDatabase } from "./database.js";
+import { registerSchedulingRoutes, withScheduleLock } from "./scheduling.js";
 import {
   email,
   password,
@@ -61,7 +66,18 @@ export function createApp({
       await setResponse(res, await authentication.handler(request));
     }),
   );
-  app.use(express.json({ limit: "32kb", strict: true }));
+  const billing = createBilling({ db });
+  app.post(
+    "/integrations/stripe/webhook",
+    express.raw({ type: "application/json", limit: "1mb" }),
+    billing.webhook,
+  );
+  app.use(
+    "/orgs/:orgId/workforce/files",
+    rateLimit({ max: 10 }),
+    express.json({ limit: "5mb", strict: true }),
+  );
+  app.use(express.json({ limit: "256kb", strict: true }));
   app.use((req, res, next) => {
     res.set("X-Content-Type-Options", "nosniff");
     res.set("Cache-Control", "no-store");
@@ -102,7 +118,37 @@ export function createApp({
     (await unwrap(filter(db.from(table).select(cols)))) || [];
   const row = async (table, cols, filter) =>
     (await rows(table, cols, (q) => filter(q).limit(1)))[0] || null;
-  const rpc = (name, params) => unwrap(db.rpc(name, params));
+  const rpc = (name, params) =>
+    [
+      "pulse_manage_member",
+      "pulse_create_invitation",
+      "pulse_revoke_invitation",
+    ].includes(name)
+      ? withScheduleLock(db, async (client) => {
+          await client.query("select set_config('pulseshift.actor',$1,true)", [
+            params.p_actor_id || params.p_user_id,
+          ]);
+          return unwrap(createDatabase(client).rpc(name, params));
+        })
+      : unwrap(db.rpc(name, params));
+  const requestRpc = (name, params) =>
+    withScheduleLock(db, async (client) => {
+      await client.query("select set_config('pulseshift.actor',$1,true)", [
+        params.p_user_id,
+      ]);
+      const result = await unwrap(createDatabase(client).rpc(name, params));
+      await client.query(
+        "insert into workforce_audit(org_id,actor_id,action,entity_id,details) values($1,$2,$3,$4,$5::jsonb)",
+        [
+          params.p_org_id,
+          params.p_user_id,
+          name.replace("pulse_", "").toUpperCase(),
+          params.p_id,
+          JSON.stringify({ status: params.p_status || null }),
+        ],
+      );
+      return result;
+    });
   const orgDto = (source) => {
     const o = effectiveOrg(source);
     return {
@@ -257,19 +303,15 @@ export function createApp({
       } catch (error) {
         // The identity remains usable: show resumable setup instead of deleting a valid account.
         if (error.status && error.status < 500)
-          return res
-            .status(201)
-            .json({
-              ...(await session(user, result.token)),
-              setupError: error.message,
-            });
-        logger.error("Workspace setup needs retry", { code: error.code });
-        return res
-          .status(201)
-          .json({
+          return res.status(201).json({
             ...(await session(user, result.token)),
-            setupError: "Account created. Please retry workspace setup.",
+            setupError: error.message,
           });
+        logger.error("Workspace setup needs retry", { code: error.code });
+        return res.status(201).json({
+          ...(await session(user, result.token)),
+          setupError: "Account created. Please retry workspace setup.",
+        });
       }
       res.status(201).json(await session(user, result.token));
     }),
@@ -277,14 +319,7 @@ export function createApp({
   app.post(
     "/auth/login",
     asyncHandler(async (req, res) => {
-      const result = await authentication.api.signInEmail({
-        body: {
-          email: email(req.body.email),
-          password: password(req.body.password),
-        },
-        headers: fromNodeHeaders(req.headers),
-      });
-      res.json(await session(await syncUser(result.user), result.token));
+      await accountSecurity.signIn(req, res);
     }),
   );
   app.get(
@@ -310,6 +345,16 @@ export function createApp({
       res.status(201).json(await session(req.user));
     }),
   );
+  const workforce = createWorkforce({ db });
+  workforce.register(app, { auth, member, asyncHandler });
+  billing.register(app, { auth, member, admin, asyncHandler });
+  const accountSecurity = createAccountSecurity({
+    db,
+    authentication,
+    session,
+    syncUser,
+  });
+  accountSecurity.register(app, { auth, asyncHandler });
   const requests = (orgId) =>
     rows("requests", "*", (q) =>
       q
@@ -318,6 +363,14 @@ export function createApp({
         .order("created_at", { ascending: false })
         .limit(500),
     );
+  registerSchedulingRoutes(app, {
+    db,
+    auth,
+    member,
+    admin,
+    asyncHandler,
+    extensions: workforce,
+  });
   app.get(
     "/orgs/:orgId/full",
     auth,
@@ -365,7 +418,7 @@ export function createApp({
     asyncHandler(async (req, res) => {
       if (!isIsoDate(req.body.date) || !REQUEST_TYPES.has(req.body.type))
         throw httpError(400, "Valid date and request type required");
-      const result = await rpc("pulse_create_request", {
+      const result = await requestRpc("pulse_create_request", {
         p_id: `req-${randomUUID()}`,
         p_org_id: req.orgId,
         p_user_id: req.userId,
@@ -387,7 +440,7 @@ export function createApp({
         throw httpError(400, "Invalid request type");
       if (status && !["APPROVED", "REJECTED"].includes(status))
         throw httpError(400, "Invalid decision");
-      const result = await rpc("pulse_update_request", {
+      const result = await requestRpc("pulse_update_request", {
         p_org_id: req.orgId,
         p_id: req.params.requestId,
         p_user_id: req.userId,
@@ -406,7 +459,7 @@ export function createApp({
     auth,
     member,
     asyncHandler(async (req, res) => {
-      await rpc("pulse_cancel_request", {
+      await requestRpc("pulse_cancel_request", {
         p_org_id: req.orgId,
         p_id: req.params.requestId,
         p_user_id: req.userId,
@@ -504,12 +557,31 @@ export function createApp({
     member,
     admin,
     asyncHandler(async (req, res) => {
-      await rpc("pulse_manage_member", {
-        p_org_id: req.orgId,
-        p_actor_id: req.userId,
-        p_user_id: req.params.userId,
-        p_role: null,
-        p_remove: true,
+      await withScheduleLock(db, async (client) => {
+        await client.query(
+          "select id from organizations where id=$1 for update",
+          [req.orgId],
+        );
+        const assigned = await client.query(
+          `select 1 from schedule_documents d,
+          jsonb_array_elements(d.data->'published') s, jsonb_array_elements(s->'assignments') a
+          where d.org_id=$1 and a->>'userId'=$2 and (s->>'endsAt')::timestamptz>now() limit 1`,
+          [req.orgId, req.params.userId],
+        );
+        if (assigned.rows.length)
+          throw httpError(
+            409,
+            "Unassign this member from upcoming shifts and publish the changes before removing them.",
+          );
+        await unwrap(
+          createDatabase(client).rpc("pulse_manage_member", {
+            p_org_id: req.orgId,
+            p_actor_id: req.userId,
+            p_user_id: req.params.userId,
+            p_role: null,
+            p_remove: true,
+          }),
+        );
       });
       res.json({ ok: true });
     }),
@@ -582,7 +654,7 @@ export function createApp({
         req.orgId,
         req.userId,
         "ANALYZE",
-        `Provide an advisory staffing insight, not an approval or guaranteed availability check. Date ${req.body.date}; type ${req.body.type}; approved date-only work requests ${coverage.length}. Actual staffing requirements and shift times are unknown. Return JSON {"isHighDemand": boolean, "message": "short cautious recommendation"}.`,
+        `Provide an advisory staffing insight, not an approval or guaranteed availability check. Date ${req.body.date}; type ${req.body.type}; approved date-only availability requests ${coverage.length}. These are not shift assignments. This insight does not inspect the timed schedule; managers must use the Shift planner for deterministic coverage and conflict checks. Return JSON {"isHighDemand": boolean, "message": "short cautious recommendation"}.`,
         {
           isHighDemand: false,
           message:

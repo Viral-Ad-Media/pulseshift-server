@@ -1,7 +1,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { readFile } from "node:fs/promises";
 // pg-compatible transport for real Better Auth + SQL integration tests.
-export async function testDatabase() {
+export async function testDatabase({ scheduling = true } = {}) {
   const engine = new PGlite();
   const pool = {
     async query(sql, values) {
@@ -31,7 +31,7 @@ export async function testDatabase() {
     },
   };
   // Multi-statement migrations use exec; application queries use query.
-  for (const file of ["db/schema.sql", "db/migrations/20261005_audit.sql"])
+  for (const file of ["db/schema.sql", "db/migrations/20261005_audit.sql", ...(scheduling ? ["db/migrations/20261111_scheduling.sql", "db/migrations/20261113_workforce.sql"] : [])])
     await engine.exec(await readFile(file, "utf8"));
   return { pool, engine };
 }

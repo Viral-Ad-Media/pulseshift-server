@@ -8,7 +8,7 @@ import { importLegacy } from "../scripts/import-legacy.js";
 import { createDatabase } from "../database.js";
 import { createAuthentication } from "../auth.js";
 test("versioned migration runner is repeatable and produces a ready Better Auth schema", async () => {
-  const { pool } = await testDatabase();
+  const { pool } = await testDatabase({ scheduling: false });
   try {
     await migrate(pool);
     await migrate(pool);
@@ -20,7 +20,7 @@ test("versioned migration runner is repeatable and produces a ready Better Auth 
     assert.equal(
       (await pool.query("select count(*)::int as n from schema_migrations"))
         .rows[0].n,
-      3,
+      6,
     );
   } finally {
     await pool.end();
@@ -31,7 +31,7 @@ test("read-only legacy import preserves identities, memberships and medical note
     target = await testDatabase();
   try {
     await target.engine.exec(
-      await readFile("db/migrations/20261104_better_auth.sql", "utf8"),
+      await readFile("db/migrations/20261104_better_auth.sql", "utf8") + "\n" + await readFile("db/migrations/20261113_two_factor.sql", "utf8"),
     );
     const sourceDb = createDatabase(source.pool);
     const passwordHash = await bcrypt.hash("shortpass", 10);

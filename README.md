@@ -1,6 +1,6 @@
 # PulseShift API — Neon PostgreSQL + Better Auth
 
-Express API for date-only healthcare staffing requests, private leave notes, approvals, workspaces, invitations and advisory AI. Companion frontend: `Viral-Ad-Media/pulseshift`. Supabase is no longer a runtime dependency.
+Express API for timed healthcare staff schedules, availability and leave requests, staffing checks, in-app notifications, private notes, workspaces, invitations and advisory AI. Companion frontend: `Viral-Ad-Media/pulseshift`. Supabase is no longer a runtime dependency.
 
 ## Architecture
 
@@ -71,3 +71,37 @@ Seven-day email-bound invitations reserve seats. They are manually shared, singl
 `npm run check`, `npm test`, `npm audit --audit-level=low`. Tests use the real Better Auth server and PostgreSQL SQL engine (PGlite), exercising legacy passwords/IDs, sessions, revocation, password changes, privacy, permissions, invitations, resumable setup, quota races, migrations and read-only import. PGlite is single-connection; production multi-connection load testing remains a staging check. CI runs these checks on every PR.
 
 Auth limits use bounded per-process memory and Express-derived IPs. For multiple replicas, enforce shared limits at the ingress as well. Do not trust user-supplied forwarded IPs without verifying the hosting topology.
+
+
+## Timed scheduling release
+
+Apply migrations with `npm run db:migrate` before starting the updated API, then deploy the matching frontend. `20261111_scheduling.sql` adds schedule documents, idempotent operations, assignment acknowledgements and notifications. It does not convert historical WORK availability requests into assignments. No production data or remote deployment is changed by editing this repository.
+
+Managers use `GET/POST /orgs/:orgId/schedule` to manage a revisioned draft containing shifts, per-member eligible roles/limits and weekly templates. Staff receive only published shifts and their own scheduling profile/acknowledgements. Supported actions are SAVE_SHIFT, DELETE_SHIFT, DISCARD, SAVE_PROFILE, SAVE_TEMPLATE, DELETE_TEMPLATE, APPLY_TEMPLATE and PUBLISH. Mutations require a workspace revision and a stable operationId; retry the identical envelope after an uncertain transport failure. A confirmed 409 requires refresh and a new operation.
+
+Each shift has a required role/count, department, location, local start/end, resolved UTC instants, staff assignments, per-person break intervals and an acknowledgement requirement. Drafts can contain conflicts; publishing revalidates current membership, role eligibility, approved leave, overlapping assignments, minimum rest and Monday–Sunday working-hour caps. Actual elapsed time and breaks are counted across local week boundaries and DST changes. Missing/ambiguous local clock times are rejected. A manager must explicitly set allowGaps to publish understaffed intervals. Other conflicts cannot be overridden. Eligibility is manager-maintained; no independent credential verification is claimed. Rest/hour settings are organizational rules, not a statutory compliance engine.
+
+Short transactions use a PostgreSQL advisory transaction lock before organization row locks for schedule, acknowledgement and HTTP request mutations. This serializes shared-worker checks across workspaces; it prioritizes correctness for small-team pilots. Approved leave is additionally guarded by a database trigger against published assignments, including overnight/cross-workspace conflicts. Membership removal through the API is blocked while the member has upcoming published assignments. Rules configured in another workspace are checked without returning that workspace's shift details.
+
+`POST /orgs/:orgId/schedule/:shiftId/acknowledge` requires the current publicationVersion and an assignment to the authenticated user. Editing an assignment does not change its published snapshot; publishing a meaningful change creates a new acknowledgement version. Notifications are inserted transactionally with published assignment changes and request changes. Unchanged assignments do not receive duplicate notices or lose acknowledgements.
+
+`GET /orgs/:orgId/notifications` returns the latest 100 personal items plus the total unread count. `PUT /orgs/:orgId/notifications/read` marks one personal item or the inbox read. Reminders are generated idempotently on inbox polling for assignments starting within 24 hours; there is no unattended notification worker, email, SMS or push delivery. `GET /orgs/:orgId/request-history` returns the latest 200 requests, including cancellations and their event history. Staff can access only their own request history; administrators can access their team's private history.
+
+Limits: 1,000 retained shifts, 50 templates, up to 12 repeated weeks, 100 assignees per shift and 24 elapsed hours per shift. Storage uses a revisioned JSON document per workspace, so schedule edits serialize within the workspace. Staging verification on real PostgreSQL with multiple connections is required before broad rollout; PGlite tests verify SQL and HTTP behavior but do not substitute for a production concurrency/load test.
+
+Release smoke check: configure eligible roles → create a draft shift → verify it is hidden from staff → publish → sign in as assigned staff → read notification → acknowledge → edit and republish → verify a new acknowledgement is needed. Also verify overnight leave rejection, conflicting edits, template repetition and private cancelled-request history.
+
+
+## Workforce implementation and isolated local API
+
+Run `npm run dev:local` for a persistent PGlite-backed local test API on `127.0.0.1:4000`. It applies the migrations to `.local-data/database`, stores its local auth secret in the ignored data directory, approves `http://localhost:3000`, and never uses the hosted DATABASE_URL. Hosted users are not copied. External email and billing credentials are ignored by this mode unless `LOCAL_EXTERNAL_SERVICES=1` is explicitly set. Keep the data directory private.
+
+The new migrations add workforce state/operations, explicit assignment responses, private credential documents, audit history, billing state and Better Auth authenticator/challenge storage. `workforce.js` implements role-scoped, revisioned mutations under the shared scheduling transaction lock. Every client mutation has an operation ID; identical successful retries replay instead of duplicating. Credential rules are checked again on publication, replacements and swaps. Accepted assignment hours come from explicit ACCEPT responses, not from the older acknowledgement table.
+
+Workforce data includes deterministic builder explanations, absence/extra-shift previews, controlled-round replacement invitations, colleague-consented/manager-approved swaps, actual clock events and proposed corrections, rates/policy snapshots, daily payroll estimates, scoped department tools and preview/confirm CSV imports. Fairness definitions and gross-estimate limits are returned with reports. Unknown rates/policies stay null. CSV output escapes spreadsheet formulas. Calendar output is a private bearer-authenticated ICS download, not a public token URL.
+
+`account-security.js` wraps Better Auth's actual TOTP/backup-code flows for bearer-session deployments. A password-only sign-in of a 2FA account returns a short-lived challenge, never an authenticated token; the challenge is hashed, limited and single-use. Native auth routes still enforce the same plugin. Enrollment/disable responses propagate rotated session tokens. Recovery uses single-use Better Auth tokens and revokes other sessions.
+
+Provider activation is separate from local implementation. Set FRONTEND_URL, RESEND_API_KEY and MAIL_FROM with a verified sender to activate password reset. Configure STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET and the two allowed price IDs to activate checkout/portal. Stripe webhooks use the raw request body, a five-minute HMAC timestamp window, event deduplication and current subscription retrieval. A checkout redirect alone never grants a paid plan. Subscribe to customer.subscription.created/updated/deleted. No independent credential verification provider is currently connected; uploaded and manager-reviewed records are explicitly distinguished.
+
+Capacity and concurrency remain appropriate for small-team pilots: revisioned JSON workspace documents serialize writes, private uploads are limited to 3 MB, imports to 200 rows, and workforce records have explicit caps. Before production rollout, verify real PostgreSQL concurrent claims/edits, restore procedures and load limits in staging. The automated PGlite/HTTP tests verify application behavior but are not a production load test.

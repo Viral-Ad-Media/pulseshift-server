@@ -68,7 +68,7 @@ before(async () => {
     p_notes: "Private medical reason",
   });
   await engine.exec(
-    await readFile("db/migrations/20261104_better_auth.sql", "utf8"),
+    await readFile("db/migrations/20261104_better_auth.sql", "utf8") + "\n" + await readFile("db/migrations/20261113_two_factor.sql", "utf8"),
   );
   authentication = createAuthentication({ pool, secret });
   server = createApp({
